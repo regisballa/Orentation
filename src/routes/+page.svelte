@@ -8,7 +8,7 @@
   let number = $state(1);
   let rolling = $state(false);
   let started = $state(false);
-  let error = $state('');
+  let motionOn = $state(true);
   let canvas = $state();
 
   let beta = 0;
@@ -123,7 +123,6 @@
   }
 
   async function start() {
-    error = '';
     try {
       // iPhone needs permission (must be triggered by a button tap)
       if (
@@ -132,18 +131,17 @@
       ) {
         const motion = await DeviceMotionEvent.requestPermission();
         const orientation = await DeviceOrientationEvent.requestPermission();
-        if (motion !== 'granted' || orientation !== 'granted') {
-          error = 'Motion access was denied.';
-          return;
-        }
+        motionOn = motion === 'granted' && orientation === 'granted';
       }
     } catch {
-      error = 'Could not get motion access.';
-      return;
+      motionOn = false;
     }
 
-    window.addEventListener('devicemotion', onMotion);
-    window.addEventListener('deviceorientation', onOrientation);
+    // Without motion access the dice still works by tapping
+    if (motionOn) {
+      window.addEventListener('devicemotion', onMotion);
+      window.addEventListener('deviceorientation', onOrientation);
+    }
     started = true;
     roll(); // first drop onto the table
   }
@@ -155,8 +153,9 @@
     const ctx = c.getContext('2d');
     const g = ctx.createRadialGradient(128, 128, 0, 128, 128, 128);
     g.addColorStop(0, '#ffffff');
-    g.addColorStop(0.45, 'rgba(255,255,255,0.6)');
-    g.addColorStop(1, 'rgba(255,255,255,0)');
+    g.addColorStop(0.35, '#b0b0b0');
+    g.addColorStop(0.7, '#303030');
+    g.addColorStop(1, '#000000');
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, 256, 256);
     return new THREE.CanvasTexture(c);
@@ -174,7 +173,7 @@
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.1;
 
@@ -196,6 +195,8 @@
     keyLight.shadow.mapSize.set(1024, 1024);
     Object.assign(keyLight.shadow.camera, { left: -3, right: 3, top: 3, bottom: -3, near: 1, far: 20 });
     keyLight.shadow.bias = -0.0005;
+    keyLight.shadow.radius = 6;
+    keyLight.shadow.blurSamples = 16;
     scene.add(keyLight);
 
     const pinkLight = new THREE.PointLight(0xec4899, 22, 14);
@@ -210,7 +211,7 @@
     const fadeTex = radialTexture();
 
     const table = new THREE.Mesh(
-      new THREE.CircleGeometry(4.5, 64),
+      new THREE.CircleGeometry(6, 96),
       new THREE.MeshStandardMaterial({
         color: 0x2a1b5c,
         roughness: 0.55,
@@ -305,15 +306,18 @@
     window.addEventListener('resize', resize);
 
     // ---------- Render loop ----------
-    const clock = new THREE.Clock();
+    let last = performance.now();
+    let time = 0;
     const dq = new THREE.Quaternion();
     const showAxis = new THREE.Vector3(0.3, 1, 0.2).normalize();
     let raf;
 
     function tick() {
       raf = requestAnimationFrame(tick);
-      const dt = Math.min(clock.getDelta(), 0.05);
-      const time = clock.elapsedTime;
+      const now = performance.now();
+      const dt = Math.min((now - last) / 1000, 0.05);
+      last = now;
+      time += dt;
       phaseTime += dt;
 
       if (phase === 'showcase') {
@@ -396,9 +400,6 @@
       <h1>Dice</h1>
       <p class="sub">Shake your phone to roll</p>
       <button class="start" onclick={start}>Start</button>
-      {#if error}
-        <p class="error" in:fly={{ y: 8 }}>{error}</p>
-      {/if}
     </section>
   {:else}
     <header class="result" in:fade={{ delay: 300 }}>
@@ -412,7 +413,11 @@
     </header>
 
     <p class="hint" in:fly={{ y: 20, delay: 500 }}>
-      <span class="phone">📱</span> Shake or tap to roll
+      {#if motionOn}
+        <span class="phone">📱</span> Shake or tap to roll
+      {:else}
+        👆 Tap the dice to roll
+      {/if}
     </p>
   {/if}
 </main>
@@ -492,12 +497,6 @@
 
   .start:active {
     transform: scale(0.95);
-  }
-
-  .error {
-    margin-top: 1rem;
-    color: #fca5a5;
-    font-size: 0.9rem;
   }
 
   /* ---------- Game screen ---------- */
