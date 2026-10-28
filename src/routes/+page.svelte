@@ -1,33 +1,55 @@
 <script>
-  import { fly, fade, scale } from 'svelte/transition';
+  import { onMount } from 'svelte';
+  import { fade, fly } from 'svelte/transition';
+  import * as THREE from 'three';
+  import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+  import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
   let number = $state(1);
   let rolling = $state(false);
   let started = $state(false);
   let error = $state('');
+  let canvas = $state();
 
   let beta = 0;
   let gamma = 0;
 
-  // Pip positions on a 3x3 grid (cells 1 to 9)
-  const pips = {
-    1: [5],
-    2: [1, 9],
-    3: [1, 5, 9],
-    4: [1, 3, 7, 9],
-    5: [1, 3, 5, 7, 9],
-    6: [1, 3, 4, 6, 7, 9]
+  // ---------- Dice data ----------
+  const UP = new THREE.Vector3(0, 1, 0);
+
+  // Which side of the cube carries which number (opposite sides add up to 7)
+  const FACE_NORMALS = {
+    1: new THREE.Vector3(0, 1, 0),
+    6: new THREE.Vector3(0, -1, 0),
+    2: new THREE.Vector3(0, 0, 1),
+    5: new THREE.Vector3(0, 0, -1),
+    3: new THREE.Vector3(1, 0, 0),
+    4: new THREE.Vector3(-1, 0, 0)
   };
 
-  // Cube rotation that brings each face to the front
-  const faceRotation = {
-    1: 'rotateX(0deg) rotateY(0deg)',
-    2: 'rotateX(0deg) rotateY(-90deg)',
-    3: 'rotateX(-90deg) rotateY(0deg)',
-    4: 'rotateX(90deg) rotateY(0deg)',
-    5: 'rotateX(0deg) rotateY(90deg)',
-    6: 'rotateX(0deg) rotateY(180deg)'
+  // Pip positions on a 3x3 grid, from -1 to 1
+  const PIPS = {
+    1: [[0, 0]],
+    2: [[-1, -1], [1, 1]],
+    3: [[-1, -1], [0, 0], [1, 1]],
+    4: [[-1, -1], [1, -1], [-1, 1], [1, 1]],
+    5: [[-1, -1], [1, -1], [0, 0], [-1, 1], [1, 1]],
+    6: [[-1, -1], [-1, 0], [-1, 1], [1, -1], [1, 0], [1, 1]]
   };
+
+  const ROLL_TIME = 1.0;   // seconds in the air
+  const SETTLE_TIME = 0.6; // seconds to tip onto the final side
+
+  // ---------- Animation state (used by the render loop) ----------
+  let dice;
+  let phase = 'showcase'; // showcase | roll | settle | rest
+  let phaseTime = 0;
+  let startOffset = 0;
+  let ringT = 1;
+  const spinAxis = new THREE.Vector3();
+  const settleFrom = new THREE.Quaternion();
+  const settleTo = new THREE.Quaternion();
+  const tmpMatrix = new THREE.Matrix4();
 
   // Which number is shown for the current phone position?
   function readNumber() {
@@ -50,14 +72,42 @@
     return number;
   }
 
+  // How high the center must be so the cube never sinks into the floor
+  function restHeight(q) {
+    const e = tmpMatrix.makeRotationFromQuaternion(q).elements;
+    const raw = 0.5 * (Math.abs(e[1]) + Math.abs(e[5]) + Math.abs(e[9]));
+    return 0.5 + (raw - 0.5) * 0.85; // rounded corners sit a bit lower
+  }
+
+  // Rotation that puts number n on top, turned so it needs the least spin
+  function targetRotation(n) {
+    const align = new THREE.Quaternion().setFromUnitVectors(FACE_NORMALS[n], UP);
+    let best = null;
+    let bestAngle = Infinity;
+    for (let k = 0; k < 4; k++) {
+      const yaw = new THREE.Quaternion().setFromAxisAngle(
+        UP,
+        Math.PI / 4 + (k * Math.PI) / 2 + (Math.random() - 0.5) * 0.3
+      );
+      const candidate = yaw.multiply(align);
+      const angle = dice.quaternion.angleTo(candidate);
+      if (angle < bestAngle) {
+        bestAngle = angle;
+        best = candidate;
+      }
+    }
+    return best;
+  }
+
   function roll() {
-    if (rolling) return;
+    if (!started || rolling || !dice) return;
     rolling = true;
-    setTimeout(() => {
-      number = readNumber();
-      rolling = false;
-      navigator.vibrate?.(40); // small buzz on landing (Android)
-    }, 1000);
+    phase = 'roll';
+    phaseTime = 0;
+    startOffset = dice.position.y - restHeight(dice.quaternion);
+    spinAxis
+      .set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5)
+      .normalize();
   }
 
   function onMotion(event) {
@@ -76,7 +126,10 @@
     error = '';
     try {
       // iPhone needs permission (must be triggered by a button tap)
-      if (typeof DeviceMotionEvent?.requestPermission === 'function') {
+      if (
+        typeof DeviceMotionEvent !== 'undefined' &&
+        typeof DeviceMotionEvent.requestPermission === 'function'
+      ) {
         const motion = await DeviceMotionEvent.requestPermission();
         const orientation = await DeviceOrientationEvent.requestPermission();
         if (motion !== 'granted' || orientation !== 'granted') {
@@ -92,19 +145,254 @@
     window.addEventListener('devicemotion', onMotion);
     window.addEventListener('deviceorientation', onOrientation);
     started = true;
+    roll(); // first drop onto the table
   }
+
+  // Soft round gradient, used for the table and the glow
+  function radialTexture() {
+    const c = document.createElement('canvas');
+    c.width = c.height = 256;
+    const ctx = c.getContext('2d');
+    const g = ctx.createRadialGradient(128, 128, 0, 128, 128, 128);
+    g.addColorStop(0, '#ffffff');
+    g.addColorStop(0.45, 'rgba(255,255,255,0.6)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, 256, 256);
+    return new THREE.CanvasTexture(c);
+  }
+
+  // The two flat directions along a face, used to place the pips
+  function faceAxes(n) {
+    if (n.y) return [new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 0, 1)];
+    if (n.z) return [new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 1, 0)];
+    return [new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 1, 0)];
+  }
+
+  onMount(() => {
+    // ---------- Renderer ----------
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.1;
+
+    const scene = new THREE.Scene();
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    scene.environmentIntensity = 0.7;
+
+    const camera = new THREE.PerspectiveCamera(36, 1, 0.1, 100);
+    camera.position.set(0, 5.2, 5.6);
+    const lookTarget = new THREE.Vector3(0, 0.7, 0);
+
+    // ---------- Lights ----------
+    scene.add(new THREE.HemisphereLight(0xc4b5fd, 0x1a1033, 0.7));
+
+    const keyLight = new THREE.DirectionalLight(0xffffff, 2.4);
+    keyLight.position.set(3, 7, 4);
+    keyLight.castShadow = true;
+    keyLight.shadow.mapSize.set(1024, 1024);
+    Object.assign(keyLight.shadow.camera, { left: -3, right: 3, top: 3, bottom: -3, near: 1, far: 20 });
+    keyLight.shadow.bias = -0.0005;
+    scene.add(keyLight);
+
+    const pinkLight = new THREE.PointLight(0xec4899, 22, 14);
+    pinkLight.position.set(-3, 2.5, -2);
+    scene.add(pinkLight);
+
+    const purpleLight = new THREE.PointLight(0x8b5cf6, 18, 14);
+    purpleLight.position.set(3, 1.5, -3);
+    scene.add(purpleLight);
+
+    // ---------- Table ----------
+    const fadeTex = radialTexture();
+
+    const table = new THREE.Mesh(
+      new THREE.CircleGeometry(4.5, 64),
+      new THREE.MeshStandardMaterial({
+        color: 0x2a1b5c,
+        roughness: 0.55,
+        metalness: 0.15,
+        transparent: true,
+        alphaMap: fadeTex
+      })
+    );
+    table.rotation.x = -Math.PI / 2;
+    table.receiveShadow = true;
+    scene.add(table);
+
+    const glow = new THREE.Mesh(
+      new THREE.CircleGeometry(1.8, 48),
+      new THREE.MeshBasicMaterial({
+        color: 0xa855f7,
+        map: fadeTex,
+        transparent: true,
+        opacity: 0.25,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+      })
+    );
+    glow.rotation.x = -Math.PI / 2;
+    glow.position.y = 0.004;
+    scene.add(glow);
+
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(0.62, 0.7, 64),
+      new THREE.MeshBasicMaterial({
+        color: 0xd8b4fe,
+        transparent: true,
+        opacity: 0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+      })
+    );
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = 0.01;
+    scene.add(ring);
+
+    // ---------- Dice ----------
+    dice = new THREE.Group();
+
+    const body = new THREE.Mesh(
+      new RoundedBoxGeometry(1, 1, 1, 6, 0.13),
+      new THREE.MeshPhysicalMaterial({
+        color: 0xf8f6ff,
+        roughness: 0.22,
+        clearcoat: 1,
+        clearcoatRoughness: 0.08
+      })
+    );
+    body.castShadow = true;
+    body.receiveShadow = true;
+    dice.add(body);
+
+    const pipGeo = new THREE.SphereGeometry(1, 24, 16);
+    const pipMat = new THREE.MeshPhysicalMaterial({ color: 0x17121f, roughness: 0.35, clearcoat: 1 });
+    const redMat = new THREE.MeshPhysicalMaterial({ color: 0xe11d48, roughness: 0.3, clearcoat: 1 });
+
+    for (const [key, normal] of Object.entries(FACE_NORMALS)) {
+      const n = Number(key);
+      const [u, v] = faceAxes(normal);
+      const r = n === 1 ? 0.14 : 0.085;
+      for (const [a, b] of PIPS[n]) {
+        const pip = new THREE.Mesh(pipGeo, n === 1 ? redMat : pipMat);
+        pip.position
+          .copy(normal)
+          .multiplyScalar(0.5)
+          .addScaledVector(u, a * 0.26)
+          .addScaledVector(v, b * 0.26);
+        pip.scale.set(normal.x ? r * 0.3 : r, normal.y ? r * 0.3 : r, normal.z ? r * 0.3 : r);
+        dice.add(pip);
+      }
+    }
+
+    dice.position.y = 1.4;
+    dice.rotation.set(0.5, 0.6, 0.2);
+    scene.add(dice);
+
+    // ---------- Resize ----------
+    function resize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.fov = w < h ? 40 : 32;
+      camera.updateProjectionMatrix();
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    // ---------- Render loop ----------
+    const clock = new THREE.Clock();
+    const dq = new THREE.Quaternion();
+    const showAxis = new THREE.Vector3(0.3, 1, 0.2).normalize();
+    let raf;
+
+    function tick() {
+      raf = requestAnimationFrame(tick);
+      const dt = Math.min(clock.getDelta(), 0.05);
+      const time = clock.elapsedTime;
+      phaseTime += dt;
+
+      if (phase === 'showcase') {
+        // Floating and slowly turning on the start screen
+        dice.position.y = 1.4 + Math.sin(time * 1.6) * 0.12;
+        dq.setFromAxisAngle(showAxis, dt * 0.8);
+        dice.quaternion.premultiply(dq);
+      } else if (phase === 'roll') {
+        const t = Math.min(phaseTime / ROLL_TIME, 1);
+
+        spinAxis.applyAxisAngle(UP, dt * 3);
+        dq.setFromAxisAngle(spinAxis, dt * 16 * (1 - t * 0.7));
+        dice.quaternion.premultiply(dq);
+
+        const bounce = Math.abs(Math.sin(t * Math.PI * 2.5)) * 1.6 * Math.pow(1 - t, 1.6);
+        dice.position.y = restHeight(dice.quaternion) + bounce + startOffset * Math.pow(1 - t, 3);
+        dice.position.x = Math.sin(t * Math.PI * 2) * 0.5 * (1 - t);
+        dice.position.z = Math.sin(t * Math.PI * 1.5) * 0.3 * (1 - t);
+
+        if (t >= 1) {
+          number = readNumber();
+          settleFrom.copy(dice.quaternion);
+          settleTo.copy(targetRotation(number));
+          phase = 'settle';
+          phaseTime = 0;
+        }
+      } else if (phase === 'settle') {
+        const s = Math.min(phaseTime / SETTLE_TIME, 1);
+        const ease = 1 - Math.pow(1 - s, 3);
+        dice.quaternion.slerpQuaternions(settleFrom, settleTo, ease);
+        dice.position.y = restHeight(dice.quaternion) + Math.sin(s * Math.PI) * 0.2 * (1 - s);
+        dice.position.x = 0;
+        dice.position.z = 0;
+
+        if (s >= 1) {
+          phase = 'rest';
+          rolling = false;
+          ringT = 0;
+          navigator.vibrate?.(40);
+        }
+      }
+
+      // Landing ring
+      if (ringT < 1) {
+        ringT = Math.min(ringT + dt / 0.7, 1);
+        ring.scale.setScalar(1 + ringT * 1.8);
+        ring.material.opacity = 0.7 * (1 - ringT);
+        glow.material.opacity = 0.25 + 0.3 * (1 - ringT);
+      }
+
+      // Glow follows the dice
+      glow.position.x = dice.position.x;
+      glow.position.z = dice.position.z;
+
+      // Camera moves a little with the phone tilt
+      const tx = Math.max(-1, Math.min(1, gamma / 45)) * 0.8 + Math.sin(time * 0.3) * 0.25;
+      camera.position.x += (tx - camera.position.x) * 0.05;
+      camera.lookAt(lookTarget);
+
+      renderer.render(scene, camera);
+    }
+    tick();
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('resize', resize);
+      window.removeEventListener('devicemotion', onMotion);
+      window.removeEventListener('deviceorientation', onOrientation);
+      pmrem.dispose();
+      renderer.dispose();
+    };
+  });
 </script>
 
 <main>
-  <div class="glow"></div>
+  <canvas bind:this={canvas} onclick={roll}></canvas>
 
   {#if !started}
-    <section class="intro" out:fade={{ duration: 250 }}>
-      <div class="mini-die" aria-hidden="true">
-        {#each Array(9) as _, i}
-          <span class:pip={pips[5].includes(i + 1)}></span>
-        {/each}
-      </div>
+    <section class="intro" out:fade={{ duration: 300 }}>
       <h1>Dice</h1>
       <p class="sub">Shake your phone to roll</p>
       <button class="start" onclick={start}>Start</button>
@@ -113,44 +401,19 @@
       {/if}
     </section>
   {:else}
-    <section class="game" in:scale={{ start: 0.85, duration: 450 }}>
-      <!-- Tap also rolls, handy for testing on a laptop -->
-      <div
-        class="scene"
-        role="button"
-        tabindex="0"
-        aria-label="Roll the dice"
-        onclick={roll}
-        onkeydown={(e) => e.key === 'Enter' && roll()}
-      >
-        <div class="tilt">
-          <div class="tumble" class:rolling>
-            <div class="cube" style:transform={faceRotation[number]}>
-              {#each [1, 2, 3, 4, 5, 6] as face}
-                <div class="face f{face}">
-                  {#each Array(9) as _, i}
-                    <span class:pip={pips[face].includes(i + 1)}></span>
-                  {/each}
-                </div>
-              {/each}
-            </div>
-          </div>
-        </div>
-        <div class="shadow" class:rolling></div>
-      </div>
+    <header class="result" in:fade={{ delay: 300 }}>
+      {#if rolling}
+        <span class="label" in:fade={{ duration: 150 }}>Rolling…</span>
+      {:else}
+        {#key number}
+          <span class="value" in:fly={{ y: 24, duration: 450 }}>{number}</span>
+        {/key}
+      {/if}
+    </header>
 
-      <div class="result">
-        {#if rolling}
-          <span class="label" in:fade={{ duration: 150 }}>Rolling…</span>
-        {:else}
-          {#key number}
-            <span class="value" in:fly={{ y: 20, duration: 400 }}>{number}</span>
-          {/key}
-        {/if}
-      </div>
-
-      <p class="hint"><span class="phone">📱</span> Shake the phone to roll</p>
-    </section>
+    <p class="hint" in:fly={{ y: 20, delay: 500 }}>
+      <span class="phone">📱</span> Shake or tap to roll
+    </p>
   {/if}
 </main>
 
@@ -161,47 +424,43 @@
   }
 
   main {
-    --size: 140px;
-    --accent-1: #8b5cf6;
-    --accent-2: #ec4899;
-
-    position: relative;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 100dvh;
+    position: fixed;
+    inset: 0;
     overflow: hidden;
     color: #f4f2ff;
     font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
-    background: radial-gradient(circle at 50% 25%, #2a1d5e 0%, #0b0a17 65%);
+    background:
+      radial-gradient(circle at 50% 35%, rgba(139, 92, 246, 0.35), transparent 55%),
+      radial-gradient(circle at 50% 100%, #1d1240 0%, #0b0a17 70%);
     user-select: none;
     -webkit-tap-highlight-color: transparent;
   }
 
-  .glow {
+  canvas {
     position: absolute;
-    width: 420px;
-    height: 420px;
-    border-radius: 50%;
-    background: radial-gradient(circle, rgba(139, 92, 246, 0.35), transparent 70%);
-    filter: blur(40px);
-    animation: breathe 6s ease-in-out infinite;
-    pointer-events: none;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    cursor: pointer;
   }
 
-  /* ---------- Intro ---------- */
-  .intro,
-  .game {
-    position: relative;
+  /* ---------- Start screen ---------- */
+  .intro {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 10vh;
     display: flex;
     flex-direction: column;
     align-items: center;
     text-align: center;
+    pointer-events: none;
   }
 
   h1 {
-    margin: 1.5rem 0 0.25rem;
-    font-size: 3rem;
+    margin: 0 0 0.25rem;
+    font-size: 3.2rem;
     font-weight: 800;
     letter-spacing: -0.03em;
     background: linear-gradient(90deg, #fff, #c4b5fd);
@@ -211,32 +470,20 @@
   }
 
   .sub {
-    margin: 0 0 2rem;
+    margin: 0 0 1.8rem;
     color: #a9a3c9;
   }
 
-  .mini-die {
-    display: grid;
-    grid-template: repeat(3, 1fr) / repeat(3, 1fr);
-    width: 84px;
-    height: 84px;
-    padding: 12px;
-    box-sizing: border-box;
-    border-radius: 20px;
-    background: linear-gradient(145deg, #ffffff, #ddd8ef);
-    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.45), inset 0 -4px 10px rgba(0, 0, 0, 0.12);
-    animation: float 3s ease-in-out infinite;
-  }
-
   .start {
+    pointer-events: auto;
     font: inherit;
     font-size: 1.15rem;
     font-weight: 700;
     color: white;
-    padding: 1rem 3rem;
+    padding: 1rem 3.2rem;
     border: none;
     border-radius: 999px;
-    background: linear-gradient(135deg, var(--accent-1), var(--accent-2));
+    background: linear-gradient(135deg, #8b5cf6, #ec4899);
     box-shadow: 0 10px 30px rgba(236, 72, 153, 0.35);
     cursor: pointer;
     animation: pulse 2.4s ease-in-out infinite;
@@ -253,121 +500,55 @@
     font-size: 0.9rem;
   }
 
-  /* ---------- 3D dice ---------- */
-  .scene {
-    position: relative;
-    width: var(--size);
-    height: var(--size);
-    margin: 3rem 0 2.5rem;
-    perspective: 900px;
-    cursor: pointer;
-    outline: none;
-  }
-
-  .tilt,
-  .tumble,
-  .cube {
-    width: 100%;
-    height: 100%;
-    transform-style: preserve-3d;
-  }
-
-  .tilt {
-    transform: rotateX(-22deg) rotateY(-28deg);
-  }
-
-  .tumble.rolling {
-    animation: tumble 1s cubic-bezier(0.3, 0.6, 0.4, 1);
-  }
-
-  .cube {
-    position: relative;
-    transition: transform 0.7s cubic-bezier(0.34, 1.56, 0.64, 1);
-  }
-
-  .face {
-    position: absolute;
-    inset: 0;
-    display: grid;
-    grid-template: repeat(3, 1fr) / repeat(3, 1fr);
-    padding: 18%;
-    box-sizing: border-box;
-    border-radius: 18px;
-    background: linear-gradient(145deg, #ffffff 0%, #ece9f7 60%, #d9d4ec 100%);
-    box-shadow: inset 0 0 22px rgba(60, 40, 120, 0.18);
-    backface-visibility: hidden;
-  }
-
-  .f1 { transform: rotateY(0deg) translateZ(calc(var(--size) / 2)); }
-  .f6 { transform: rotateY(180deg) translateZ(calc(var(--size) / 2)); }
-  .f2 { transform: rotateY(90deg) translateZ(calc(var(--size) / 2)); }
-  .f5 { transform: rotateY(-90deg) translateZ(calc(var(--size) / 2)); }
-  .f3 { transform: rotateX(90deg) translateZ(calc(var(--size) / 2)); }
-  .f4 { transform: rotateX(-90deg) translateZ(calc(var(--size) / 2)); }
-
-  .pip {
-    align-self: center;
-    justify-self: center;
-    width: 72%;
-    aspect-ratio: 1;
-    border-radius: 50%;
-    background: radial-gradient(circle at 35% 30%, #4a4560, #12101c 70%);
-    box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.6), 0 1px 0 rgba(255, 255, 255, 0.8);
-  }
-
-  .f1 .pip {
-    width: 95%;
-    background: radial-gradient(circle at 35% 30%, #ff6b8a, #c0153a 70%);
-  }
-
-  .shadow {
-    position: absolute;
-    left: 50%;
-    bottom: -48px;
-    width: 120%;
-    height: 26px;
-    border-radius: 50%;
-    background: radial-gradient(ellipse, rgba(0, 0, 0, 0.55), transparent 70%);
-    transform: translateX(-50%);
-  }
-
-  .shadow.rolling {
-    animation: shadow 1s cubic-bezier(0.3, 0.6, 0.4, 1);
-  }
-
-  /* ---------- Result ---------- */
+  /* ---------- Game screen ---------- */
   .result {
+    position: absolute;
+    top: 9vh;
+    left: 0;
+    right: 0;
     display: grid;
     place-items: center;
-    height: 5rem;
+    height: 6rem;
+    pointer-events: none;
+  }
+
+  .result > * {
+    grid-area: 1 / 1;
   }
 
   .value {
-    font-size: 4.5rem;
+    font-size: 5.5rem;
     font-weight: 800;
     line-height: 1;
     background: linear-gradient(135deg, #fff, #f0abfc);
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
+    filter: drop-shadow(0 6px 24px rgba(236, 72, 153, 0.45));
   }
 
   .label {
-    font-size: 1.1rem;
-    letter-spacing: 0.2em;
+    font-size: 1.05rem;
+    letter-spacing: 0.25em;
     text-transform: uppercase;
     color: #c4b5fd;
   }
 
   .hint {
-    margin-top: 1.5rem;
-    padding: 0.6rem 1.2rem;
+    position: absolute;
+    bottom: 6vh;
+    left: 50%;
+    transform: translateX(-50%);
+    margin: 0;
+    padding: 0.65rem 1.3rem;
+    white-space: nowrap;
     border-radius: 999px;
     background: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    backdrop-filter: blur(10px);
-    color: #a9a3c9;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    backdrop-filter: blur(12px);
+    color: #c9c3e6;
     font-size: 0.95rem;
+    pointer-events: none;
   }
 
   .phone {
@@ -375,35 +556,9 @@
     animation: wiggle 2.5s ease-in-out infinite;
   }
 
-  /* ---------- Keyframes ---------- */
-  @keyframes tumble {
-    0%   { transform: translateY(0)      rotateX(0deg)   rotateY(0deg)   rotateZ(0deg); }
-    30%  { transform: translateY(-110px) rotateX(250deg) rotateY(160deg) rotateZ(80deg); }
-    60%  { transform: translateY(-10px)  rotateX(520deg) rotateY(430deg) rotateZ(220deg); }
-    80%  { transform: translateY(-40px)  rotateX(650deg) rotateY(630deg) rotateZ(320deg); }
-    100% { transform: translateY(0)      rotateX(720deg) rotateY(720deg) rotateZ(360deg); }
-  }
-
-  @keyframes shadow {
-    0%, 100% { transform: translateX(-50%) scale(1);   opacity: 1; }
-    30%      { transform: translateX(-50%) scale(0.45); opacity: 0.35; }
-    60%      { transform: translateX(-50%) scale(0.95); opacity: 0.9; }
-    80%      { transform: translateX(-50%) scale(0.75); opacity: 0.6; }
-  }
-
-  @keyframes float {
-    0%, 100% { transform: translateY(0) rotate(-6deg); }
-    50%      { transform: translateY(-10px) rotate(6deg); }
-  }
-
   @keyframes pulse {
     0%, 100% { box-shadow: 0 10px 30px rgba(236, 72, 153, 0.35); }
     50%      { box-shadow: 0 10px 45px rgba(139, 92, 246, 0.6); }
-  }
-
-  @keyframes breathe {
-    0%, 100% { transform: scale(1);   opacity: 0.8; }
-    50%      { transform: scale(1.15); opacity: 1; }
   }
 
   @keyframes wiggle {
@@ -412,16 +567,5 @@
     70% { transform: rotate(15deg); }
     75% { transform: rotate(-10deg); }
     80% { transform: rotate(10deg); }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .tumble.rolling,
-    .shadow.rolling,
-    .glow,
-    .mini-die,
-    .start,
-    .phone {
-      animation: none;
-    }
   }
 </style>
